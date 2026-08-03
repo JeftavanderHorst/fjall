@@ -88,19 +88,29 @@ impl WorkerPool {
                         let thread_counter = thread_counter.clone();
                         let poison_dart = poison_dart.clone();
 
-                        move || loop {
-                            match worker_tick(&worker_state) {
-                                Ok(should_abort) => {
-                                    if should_abort {
-                                        log::debug!("Worker #{i} closes because DB is dropping");
-                                        thread_counter.fetch_sub(1, Relaxed);
-                                        return Ok(());
+                        move || {
+                            // The counter must drop on *every* way out of this
+                            // thread, not just the graceful one: `Database::drop`
+                            // spins on it (`while counter > 0`), so a worker that
+                            // returns an error or unwinds would keep the database
+                            // closing forever.
+                            let _counter_guard = ActiveThreadGuard(thread_counter);
+
+                            loop {
+                                match worker_tick(&worker_state) {
+                                    Ok(should_abort) => {
+                                        if should_abort {
+                                            log::debug!(
+                                                "Worker #{i} closes because DB is dropping"
+                                            );
+                                            return Ok(());
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    log::error!("Worker #{i} crashed: {e:?}");
-                                    poison_dart.poison();
-                                    return Err(e);
+                                    Err(e) => {
+                                        log::error!("Worker #{i} crashed: {e:?}");
+                                        poison_dart.poison();
+                                        return Err(e);
+                                    }
                                 }
                             }
                         }
@@ -114,6 +124,19 @@ impl WorkerPool {
         *self.thread_handles.lock().expect("lock is poisoned") = thread_handles;
 
         Ok(())
+    }
+}
+
+/// Decrements the pool's active thread counter when a worker thread leaves,
+/// whatever the reason: graceful close, error return or unwinding panic.
+///
+/// `DatabaseInner::drop` waits for this counter to reach zero, so a leaked
+/// increment makes closing the database hang forever.
+struct ActiveThreadGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveThreadGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -266,5 +289,48 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// A worker leaving normally releases its slot in the counter.
+    #[test]
+    fn active_thread_guard_decrements_on_scope_exit() {
+        let counter = Arc::new(AtomicUsize::new(1));
+        {
+            let _guard = ActiveThreadGuard(counter.clone());
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// A worker that returns an error releases its slot too: `Database::drop`
+    /// spins until the counter reaches zero, so a leaked slot would hang the
+    /// close forever.
+    #[test]
+    fn active_thread_guard_decrements_on_early_return() {
+        let counter = Arc::new(AtomicUsize::new(1));
+
+        fn failing_worker(counter: Arc<AtomicUsize>) -> Result<(), ()> {
+            let _guard = ActiveThreadGuard(counter);
+            Err(())
+        }
+
+        assert!(failing_worker(counter.clone()).is_err());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// A panicking worker releases its slot as well.
+    #[test]
+    fn active_thread_guard_decrements_on_panic() {
+        let counter = Arc::new(AtomicUsize::new(1));
+        let counter_in_thread = counter.clone();
+
+        let outcome = std::thread::spawn(move || {
+            let _guard = ActiveThreadGuard(counter_in_thread);
+            panic!("worker crashed");
+        })
+        .join();
+
+        assert!(outcome.is_err());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 }

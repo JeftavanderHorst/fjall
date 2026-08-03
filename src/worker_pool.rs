@@ -9,7 +9,10 @@ use crate::{
 use lsm_tree::MemtableId;
 use std::{
     borrow::Cow,
-    sync::{atomic::AtomicUsize, Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering::Relaxed},
+        Arc, Mutex,
+    },
     thread::JoinHandle,
 };
 
@@ -63,68 +66,82 @@ impl WorkerPool {
         poison_dart: &PoisonDart,
         thread_counter: &Arc<AtomicUsize>,
     ) -> crate::Result<()> {
-        use std::sync::atomic::Ordering::Relaxed;
-
         log::debug!("Starting worker pool with {pool_size} threads");
 
-        thread_counter.fetch_add(pool_size, Relaxed);
+        let thread_handles = claim_and_spawn(pool_size, thread_counter, |i| {
+            std::thread::Builder::new()
+                .name("fjall:worker".to_string())
+                .spawn({
+                    log::trace!("Starting fjall worker thread #{i}");
 
-        let thread_handles = (0..pool_size)
-            .map(|i| {
-                std::thread::Builder::new()
-                    .name("fjall:worker".to_string())
-                    .spawn({
-                        log::trace!("Starting fjall worker thread #{i}");
+                    let worker_state = WorkerState {
+                        pool_size,
+                        worker_id: i,
+                        rx: self.rx.clone(),
+                        supervisor: supervisor.clone(),
+                        stats: stats.clone(),
+                        sender: self.sender.clone(),
+                    };
 
-                        let worker_state = WorkerState {
-                            pool_size,
-                            worker_id: i,
-                            rx: self.rx.clone(),
-                            supervisor: supervisor.clone(),
-                            stats: stats.clone(),
-                            sender: self.sender.clone(),
-                        };
+                    let thread_counter = thread_counter.clone();
+                    let poison_dart = poison_dart.clone();
 
-                        let thread_counter = thread_counter.clone();
-                        let poison_dart = poison_dart.clone();
+                    move || {
+                        // The counter must drop on *every* way out of this
+                        // thread, not just the graceful one: `Database::drop`
+                        // spins on it (`while counter > 0`), so a worker that
+                        // returns an error or unwinds would keep the database
+                        // closing forever.
+                        let _counter_guard = ActiveThreadGuard(thread_counter);
 
-                        move || {
-                            // The counter must drop on *every* way out of this
-                            // thread, not just the graceful one: `Database::drop`
-                            // spins on it (`while counter > 0`), so a worker that
-                            // returns an error or unwinds would keep the database
-                            // closing forever.
-                            let _counter_guard = ActiveThreadGuard(thread_counter);
-
-                            loop {
-                                match worker_tick(&worker_state) {
-                                    Ok(should_abort) => {
-                                        if should_abort {
-                                            log::debug!(
-                                                "Worker #{i} closes because DB is dropping"
-                                            );
-                                            return Ok(());
-                                        }
+                        loop {
+                            match worker_tick(&worker_state) {
+                                Ok(should_abort) => {
+                                    if should_abort {
+                                        log::debug!("Worker #{i} closes because DB is dropping");
+                                        return Ok(());
                                     }
-                                    Err(e) => {
-                                        log::error!("Worker #{i} crashed: {e:?}");
-                                        poison_dart.poison();
-                                        return Err(e);
-                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("Worker #{i} crashed: {e:?}");
+                                    poison_dart.poison();
+                                    return Err(e);
                                 }
                             }
                         }
-                    })
-                    .inspect_err(|_| {
-                        thread_counter.fetch_sub(1, Relaxed);
-                    })
-            })
-            .collect::<Result<_, _>>()?;
+                    }
+                })
+        })?;
 
         *self.thread_handles.lock().expect("lock is poisoned") = thread_handles;
 
         Ok(())
     }
+}
+
+/// Claims one slot in the active thread counter per worker, immediately before
+/// that worker is spawned, and hands the slot straight back if the spawn fails.
+///
+/// Claiming the whole pool up front would leak the slots of the workers a failed
+/// spawn never reaches: nothing ever decrements them, because those threads do
+/// not exist, and `DatabaseInner::drop` waits for the counter to reach zero.
+///
+/// The spawn is a parameter so the failure path can be tested without having to
+/// exhaust the operating system's thread limit.
+fn claim_and_spawn<H, S: FnMut(usize) -> std::io::Result<H>>(
+    pool_size: usize,
+    thread_counter: &Arc<AtomicUsize>,
+    mut spawn: S,
+) -> std::io::Result<Vec<H>> {
+    (0..pool_size)
+        .map(|i| {
+            thread_counter.fetch_add(1, Relaxed);
+
+            spawn(i).inspect_err(|_| {
+                thread_counter.fetch_sub(1, Relaxed);
+            })
+        })
+        .collect()
 }
 
 /// Decrements the pool's active thread counter when a worker thread leaves,
@@ -136,7 +153,7 @@ struct ActiveThreadGuard(Arc<AtomicUsize>);
 
 impl Drop for ActiveThreadGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.fetch_sub(1, Relaxed);
     }
 }
 
@@ -291,15 +308,51 @@ mod tests {
         Ok(())
     }
 
+    /// Every worker that is actually spawned holds exactly one slot.
+    #[test]
+    fn claim_and_spawn_claims_one_slot_per_worker() {
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let handles = claim_and_spawn(3, &counter, |i| Ok::<_, std::io::Error>(i))
+            .expect("all spawns succeed");
+
+        assert_eq!(handles, vec![0, 1, 2]);
+        assert_eq!(counter.load(Relaxed), 3);
+    }
+
+    /// A failed spawn releases its own slot and never claims one for the workers
+    /// it did not get to. `DatabaseInner::drop` spins until the counter reaches
+    /// zero, so a slot held by a thread that does not exist hangs the close
+    /// forever.
+    #[test]
+    fn claim_and_spawn_counts_live_workers_only() {
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let result = claim_and_spawn(4, &counter, |i| {
+            if i == 2 {
+                Err(std::io::Error::other("cannot spawn thread"))
+            } else {
+                Ok(i)
+            }
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            counter.load(Relaxed),
+            2,
+            "only the two workers that started should hold a slot",
+        );
+    }
+
     /// A worker leaving normally releases its slot in the counter.
     #[test]
     fn active_thread_guard_decrements_on_scope_exit() {
         let counter = Arc::new(AtomicUsize::new(1));
         {
             let _guard = ActiveThreadGuard(counter.clone());
-            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+            assert_eq!(counter.load(Relaxed), 1);
         }
-        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(counter.load(Relaxed), 0);
     }
 
     /// A worker that returns an error releases its slot too: `Database::drop`
@@ -315,7 +368,7 @@ mod tests {
         }
 
         assert!(failing_worker(counter.clone()).is_err());
-        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(counter.load(Relaxed), 0);
     }
 
     /// A panicking worker releases its slot as well.
@@ -331,6 +384,6 @@ mod tests {
         .join();
 
         assert!(outcome.is_err());
-        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(counter.load(Relaxed), 0);
     }
 }

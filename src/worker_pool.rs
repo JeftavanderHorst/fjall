@@ -122,7 +122,7 @@ impl WorkerPool {
 /// Claims one slot in the active thread counter per worker, immediately before
 /// that worker is spawned, and hands the slot straight back if the spawn fails.
 ///
-/// Claiming the whole pool up front would leak the slots of the workers a failed
+/// Claiming the whole pool up front would leak the slots of the workers that failed
 /// spawn never reaches: nothing ever decrements them, because those threads do
 /// not exist, and `DatabaseInner::drop` waits for the counter to reach zero.
 ///

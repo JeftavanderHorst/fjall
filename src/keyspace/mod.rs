@@ -244,15 +244,21 @@ impl Keyspace {
 
         let seqno = self.supervisor.seqno.next();
 
-        journal_writer.write_clear(self.id, seqno)?;
+        journal_writer
+            .write_clear(self.id, seqno)
+            .inspect_err(|e| {
+                log::error!(
+                    "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}",
+                );
+                self.is_poisoned.poison();
+            })?;
 
         if !self.config.manual_journal_persist {
             journal_writer
                 .persist(crate::PersistMode::Buffer)
-                .map_err(|e| {
+                .inspect_err(|e| {
                     log::error!("persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}");
                     self.is_poisoned.poison();
-                    e
                 })?;
         }
 

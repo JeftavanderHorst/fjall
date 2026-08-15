@@ -352,15 +352,12 @@ impl Database {
             return Err(crate::Error::Poisoned);
         }
 
-        if let Err(e) = self.supervisor.journal.persist(mode) {
-            self.is_poisoned.poison();
-
+        self.supervisor.journal.persist(mode).inspect_err(|e| {
             log::error!(
-                "flush failed, which is a FATAL, and possibly hardware-related, failure: {e:?}"
+                "flush failed, which is a FATAL, and possibly hardware-related, failure: {e:?}",
             );
-
-            return Err(crate::Error::Poisoned);
-        }
+            self.is_poisoned.poison();
+        })?;
 
         Ok(())
     }

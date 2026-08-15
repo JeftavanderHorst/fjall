@@ -112,18 +112,22 @@ impl WriteBatch {
 
         let batch_seqno = self.db.supervisor.seqno.next();
 
-        journal_writer.write_batch(self.data.iter(), self.data.len(), batch_seqno)?;
+        journal_writer
+            .write_batch(self.data.iter(), self.data.len(), batch_seqno)
+            .inspect_err(|e| {
+                log::error!(
+                    "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}",
+                );
+                self.db.is_poisoned.poison();
+            })?;
 
         if let Some(mode) = self.durability {
-            if let Err(e) = journal_writer.persist(mode) {
-                self.db.is_poisoned.poison();
-
+            journal_writer.persist(mode).inspect_err(|e| {
                 log::error!(
-                    "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}"
+                    "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}",
                 );
-
-                return Err(crate::Error::Poisoned);
-            }
+                self.db.is_poisoned.poison();
+            })?;
         }
 
         // TODO: maybe we can use a stack alloc hashset/vec here, such as smallset

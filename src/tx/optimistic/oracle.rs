@@ -15,7 +15,7 @@ pub enum CommitOutcome<E> {
 }
 
 pub struct Oracle {
-    pub(super) write_serialize_lock: Mutex<BTreeMap<u64, ConflictManager>>,
+    pub(super) write_serialize_lock: Mutex<BTreeMap<SeqNo, ConflictManager>>,
     pub(super) snapshot_tracker: SnapshotTracker,
 }
 

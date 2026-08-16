@@ -14,6 +14,7 @@ impl Drop for LockedFileGuardInner {
     fn drop(&mut self) {
         log::debug!("Unlocking database lock");
 
+        #[cfg(not(target_os = "android"))]
         self.0
             .unlock()
             .inspect_err(|e| {
@@ -39,6 +40,7 @@ impl LockedFileGuard {
             e => e?,
         };
 
+        #[cfg(not(target_os = "android"))]
         file.try_lock().map_err(|e| match e {
             std::fs::TryLockError::Error(e) => {
                 log::error!("Failed to acquire database lock - if this is expected, you can try opening again (maybe wait a little)");
@@ -57,23 +59,26 @@ impl LockedFileGuard {
 
         let file = OpenOptions::new().read(true).write(true).open(path)?;
 
-        for i in 1..=RETRIES {
-            if let Err(e) = file.try_lock() {
-                match e {
-                    std::fs::TryLockError::Error(e) => {
-                        log::error!("Failed to acquire database lock - if this is expected, you can try opening again (maybe wait a little)");
-                        return Err(crate::Error::Io(e));
-                    }
-                    std::fs::TryLockError::WouldBlock => {
-                        if i == RETRIES {
-                            return Err(crate::Error::Locked);
+        #[cfg(not(target_os = "android"))]
+        {
+            for i in 1..=RETRIES {
+                if let Err(e) = file.try_lock() {
+                    match e {
+                        std::fs::TryLockError::Error(e) => {
+                            log::error!("Failed to acquire database lock - if this is expected, you can try opening again (maybe wait a little)");
+                            return Err(crate::Error::Io(e));
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        std::fs::TryLockError::WouldBlock => {
+                            if i == RETRIES {
+                                return Err(crate::Error::Locked);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
                     }
+                } else {
+                    // Success
+                    break;
                 }
-            } else {
-                // Success
-                break;
             }
         }
 

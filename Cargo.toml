@@ -2,7 +2,10 @@
 name = "fjall"
 description = "Log-structured, embeddable key-value storage engine"
 license = "MIT OR Apache-2.0"
-version = "3.1.9"
+
+# Major version bump to ensure Cargo will always resolve to this fork rather than the latest crates.io version
+version = "4.0.0"
+
 edition = "2021"
 rust-version = "1.90.0"
 readme = "README.md"
